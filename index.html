@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>VL - Clients Map</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.4/dist/MarkerCluster.css" />
+  <style>
+    html,body,#map{height:100%;margin:0;padding:0}
+    .logo-marker{width:44px;height:44px;border-radius:22px;overflow:hidden;border:2px solid white;box-shadow:0 0 2px rgba(0,0,0,0.4)}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.4/dist/leaflet.markercluster.js"></script>
+
+<script>
+const map = L.map('map').setView([45,-95], 4);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+const markers = L.markerClusterGroup();
+
+// If data/clients.json exists it will populate markers.
+// For now the page will simply show the base map.
+fetch('data/clients.json').then(r=>r.json()).then(data=>{
+  data.forEach(c=>{
+    if (!c.Latitude || !c.Longitude) return;
+    const lat = parseFloat(c.Latitude), lon = parseFloat(c.Longitude);
+    if (isNaN(lat)||isNaN(lon)) return;
+    let iconHtml = `<div class="logo-marker"><img src="${c.LogoFile||''}" style="width:44px;height:44px" onerror="this.style.display='none'"></div>`;
+    const icon = L.divIcon({ html: iconHtml, className:'', iconSize:[44,44], iconAnchor:[22,44] });
+    const marker = L.marker([lat,lon], { icon });
+    const popup = `<strong>${c.CompanyName}</strong><div>${c.Address||''}</div><div style="margin-top:6px;"><a href="${c.CardURL}" target="_blank">Trello Card</a></div>`;
+    marker.bindPopup(popup);
+    markers.addLayer(marker);
+  });
+  map.addLayer(markers);
+  if (markers.getLayers().length) map.fitBounds(markers.getBounds(),{padding:[40,40]});
+}).catch(()=>{/* no data yet */});
+</script>
+</body>
+</html>
