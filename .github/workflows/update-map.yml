@@ -1,4 +1,42 @@
+name: Update Clients Map
+
 on:
   schedule:
+    # runs daily at 17:00 UTC; the script itself can check local timezone/holiday rules
     - cron: '0 17 * * *'
   workflow_dispatch: {}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests Pillow python-dateutil
+
+      - name: Run trello updater
+        env:
+          TRELLO_KEY: ${{ secrets.TRELLO_KEY }}
+          TRELLO_TOKEN: ${{ secrets.TRELLO_TOKEN }}
+          BOARD_ID: ${{ secrets.BOARD_ID }}
+          CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+        run: |
+          python scripts/trello_to_repo.py
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_message: "Update clients data and logos"
+          file_pattern: |
+            data/**
+            assets/logos/**
