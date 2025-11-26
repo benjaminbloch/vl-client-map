@@ -2,7 +2,7 @@
 """
 scripts/generate_outbound_lists.py
 
-Weekly outbound list generator — full file (corrected).
+Complete weekly outbound list generator (full, corrected).
 """
 
 import os
@@ -39,15 +39,14 @@ TITLE_KEYWORDS = [
 ]
 
 # -----------------------
-# Read sa.json fallback
+# If workflow wrote sa.json, read it (but don't validate yet)
 # -----------------------
-if not GCP_SA_JSON:
-    if os.path.exists("sa.json"):
-        try:
-            with open("sa.json", "r", encoding="utf8") as f:
-                GCP_SA_JSON = f.read().strip()
-        except Exception as e:
-            print("Warning: failed to read sa.json:", e)
+if not GCP_SA_JSON and os.path.exists("sa.json"):
+    try:
+        with open("sa.json", "r", encoding="utf8") as f:
+            GCP_SA_JSON = f.read().strip()
+    except Exception as e:
+        print("Warning: could not read sa.json:", e)
 
 # -----------------------
 # Scheduling & idempotency helpers
@@ -212,7 +211,7 @@ def in_12_months(domain, history_df):
 # -----------------------
 # Sheets helper
 # -----------------------
-def append_weekly_block_to_sheet(rep_tab_name, rows):
+def append_weekly_block_to_sheet(rep_tab_name, rows, creds=None):
     sa_json = GCP_SA_JSON
     if not sa_json and os.path.exists("sa.json"):
         with open("sa.json", "r", encoding="utf8") as f:
@@ -221,7 +220,8 @@ def append_weekly_block_to_sheet(rep_tab_name, rows):
         raise SystemExit("No Google service account JSON available (GCP_SA_JSON or sa.json).")
 
     try:
-        creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        if creds is None:
+            creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
     except Exception as e:
         raise SystemExit(f"Invalid service account JSON: {e}")
 
@@ -268,6 +268,19 @@ def main():
     # Ensure candidates exists
     if not os.path.exists(CANDIDATES_CSV):
         raise SystemExit(f"{CANDIDATES_CSV} not found. Please add candidates.csv in repo root or enable a sourcing step.")
+
+    # Validate service account JSON early — fail fast if invalid
+    sa_json = GCP_SA_JSON
+    if not sa_json and os.path.exists("sa.json"):
+        with open("sa.json", "r", encoding="utf8") as f:
+            sa_json = f.read().strip()
+    if not sa_json:
+        raise SystemExit("No Google service account JSON available. Please set GCP_SA_JSON secret or ensure sa.json exists.")
+
+    try:
+        creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    except Exception as e:
+        raise SystemExit(f"Invalid service account JSON: {e}")
 
     print("Loading candidates...")
     df = pd.read_csv(CANDIDATES_CSV, dtype=str).fillna("")
@@ -375,8 +388,8 @@ def main():
     dave_rows = to_sheet_rows(dave_df, "Dave")
 
     print("Appending to Google Sheet...")
-    append_weekly_block_to_sheet("Evan", evan_rows)
-    append_weekly_block_to_sheet("Dave", dave_rows)
+    append_weekly_block_to_sheet("Evan", evan_rows, creds)
+    append_weekly_block_to_sheet("Dave", dave_rows, creds)
 
     hist = load_assignment_history()
     for _, r in top100.iterrows():
