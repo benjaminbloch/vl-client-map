@@ -1,0 +1,57 @@
+name: Generate Outbound Lists
+
+on:
+  schedule:
+    - cron: '0 17 * * *'   # runs daily at 17:00 UTC (script will only run on Friday/holiday logic)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install system deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas requests gspread google-auth oauth2client python-dateutil holidays pytz
+
+    - name: Set Apollo key from GitHub Secrets
+      # Expose APOLLO_API_KEY to the job via GITHUB_ENV
+      run: echo "APOLLO_API_KEY=${{ secrets.APOLLO_API_KEY }}" >> $GITHUB_ENV
+
+    - name: Provide Google Sheet SA JSON as env (GCP_SA_JSON)
+      run: |
+        # write secret JSON to file and compact it for env exposure
+        echo "${{ secrets.GCP_SA_JSON }}" > sa.json
+        GCP_SA_JSON_STR=$(cat sa.json | jq -c '.')
+        echo "GCP_SA_JSON=$GCP_SA_JSON_STR" >> $GITHUB_ENV
+
+    - name: Show environment debug
+      run: |
+        echo "APOLLO_API_KEY set? ${APOLLO_API_KEY:+YES}"
+        python -c "import os; print('GCP_SA_JSON length:', len(os.environ.get('GCP_SA_JSON','')))"
+
+    - name: Run outbound list generator
+      env:
+        APOLLO_API_KEY: ${{ env.APOLLO_API_KEY }}
+        GCP_SA_JSON: ${{ env.GCP_SA_JSON }}
+        SHEET_ID: '1vVFmYqyedxNbzJWKpU4hjJhDbs96q4QqDlcq0bSIlNA'  # <-- change if different
+        WEEK_ASSIGNED: ${{ github.event.inputs.week_assigned || '' }}
+      run: |
+        python scripts/generate_outbound_lists.py
