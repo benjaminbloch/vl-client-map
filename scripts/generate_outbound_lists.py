@@ -2,30 +2,27 @@
 """
 scripts/generate_outbound_lists.py
 
-- Run only on scheduled day (Friday 10:00 America/Vancouver or Thursday when Friday is a BC stat)
-- Load candidates.csv
-- Enrich companies via Apollo (people search by domain or company)
-- Build FitScore, dedupe, apply 12-month overlap (assignment_history + prior Grok lists)
-- Select top 100, alternate-assign Evan/Dave and produce two 50-row lists
-- Append a dated block (header + column row + 50 rows + blank row) to each rep's single tab in the Google Sheet
+Fully automated weekly list generator:
+- Runs only at Friday 10:00 AM America/Vancouver (or Thursday 10:00 AM if Friday is a BC stat)
+- Idempotent: will not re-run for the same WEEK_ASSIGNED if assignment_history already contains it
+- Loads candidates.csv (or you can add an upstream sourcing step)
+- Enriches via Apollo, computes FitScore, dedupes, respects 12-month overlap
+- Produces two 50-company weekly blocks and appends to Google Sheet tabs 'Evan' and 'Dave'
 
 Environment:
 - APOLLO_API_KEY     (GitHub secret)
-- GCP_SA_JSON        (GitHub secret with Google service account JSON) OR workflow writes sa.json
-- SHEET_ID           (optional, defaults to the Sheet we used)
-- WEEK_ASSIGNED      (optional override date YYYY-MM-DD)
-
-Dependencies:
-pip install requests pandas gspread google-auth python-dateutil holidays pytz
+- GCP_SA_JSON        (GitHub secret with Google Sheets service account JSON) OR workflow writes sa.json
+- SHEET_ID           (defaults to your existing sheet)
+- WEEK_ASSIGNED      (optional override)
 """
+
 import os
 import re
 import json
 import time
-import math
 import pandas as pd
 import requests
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 import holidays
 import pytz
 from google.oauth2.service_account import Credentials
@@ -53,7 +50,7 @@ TITLE_KEYWORDS = [
 ]
 
 # -----------------------
-# Sa.json fallback: if the workflow wrote sa.json instead of providing env var, read it.
+# Sa.json fallback: read sa.json file if env is missing
 # -----------------------
 if not GCP_SA_JSON:
     if os.path.exists("sa.json"):
@@ -66,23 +63,56 @@ if not GCP_SA_JSON:
             print("Warning: failed to read sa.json:", e)
 
 # -----------------------
-# Helpers
+# Scheduling & idempotency helpers
 # -----------------------
-def should_run_today():
-    """Return True if we should run today (Friday 10:00 local or Thursday when Friday is BC stat)."""
+def should_run_today_and_hour(target_hour=10, window_minutes=60):
+    """
+    Return True if:
+      - it's Friday (local America/Vancouver) and current local time is within target_hour window,
+        AND that Friday is not a BC stat holiday,
+      - OR it's Thursday local time and tomorrow is a BC stat holiday (run Thursday in the same local hour).
+    """
     tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    today = now.date()
-    weekday = today.weekday()  # Mon 0 ... Sun 6
-    bc = holidays.CA(prov="BC")
-    # Friday that is not a BC holiday
-    if weekday == 4 and today not in bc:
-        return True
-    # If Thursday and Friday is a BC holiday, run Thursday
-    if weekday == 3 and (today + timedelta(days=1)) in bc:
-        return True
+    now_local = datetime.now(tz)
+    today_local = now_local.date()
+    weekday = today_local.weekday()  # Mon=0 ... Sun=6
+    bc_holidays = holidays.CA(prov='BC')
+
+    start = now_local.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+    end = start + timedelta(minutes=window_minutes)
+    in_window = (now_local >= start) and (now_local < end)
+
+    # Friday and not a BC holiday
+    if weekday == 4 and (today_local not in bc_holidays):
+        return in_window
+
+    # Thursday and tomorrow is BC holiday -> run Thursday
+    if weekday == 3:
+        friday = today_local + timedelta(days=1)
+        if friday in bc_holidays:
+            return in_window
+
     return False
 
+def already_ran_for_week(week_assigned_str):
+    """
+    Return True if assignment_history.csv already contains entries for the given WeekAssigned.
+    Prevents duplicate runs for the same WEEK_ASSIGNED.
+    """
+    if not os.path.exists(ASSIGNMENT_HISTORY):
+        return False
+    try:
+        hist = pd.read_csv(ASSIGNMENT_HISTORY, dtype=str)
+        if "WeekAssigned" not in hist.columns:
+            return False
+        return any(hist["WeekAssigned"].astype(str).str.strip() == str(week_assigned_str))
+    except Exception as e:
+        print("Warning: could not read assignment_history for idempotency check:", e)
+        return False
+
+# -----------------------
+# Apollo helpers and scoring
+# -----------------------
 def canonical_domain(url):
     if not isinstance(url, str):
         return ""
@@ -154,6 +184,9 @@ def compute_fit_score(row):
         score += 10
     return min(100, int(score))
 
+# -----------------------
+# Prior Grok and assignment-history helpers
+# -----------------------
 def read_prior_domains():
     domains = set()
     for path in [PRIOR_GROK_EVAN, PRIOR_GROK_DAVE]:
@@ -191,12 +224,14 @@ def in_12_months(domain, history_df):
     recent = history_df[(history_df["domain"]==domain) & (pd.to_datetime(history_df["WeekAssigned"], errors="coerce") >= cutoff)]
     return not recent.empty
 
+# -----------------------
+# Sheets helper
+# -----------------------
 def append_weekly_block_to_sheet(rep_tab_name, rows):
     sa_json = GCP_SA_JSON
-    if not sa_json:
-        if os.path.exists("sa.json"):
-            with open("sa.json","r",encoding="utf8") as f:
-                sa_json = f.read().strip()
+    if not sa_json and os.path.exists("sa.json"):
+        with open("sa.json", "r", encoding="utf8") as f:
+            sa_json = f.read().strip()
     if not sa_json:
         raise SystemExit("No Google service account JSON available (GCP_SA_JSON or sa.json).")
 
@@ -204,12 +239,14 @@ def append_weekly_block_to_sheet(rep_tab_name, rows):
         creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
     except Exception as e:
         raise SystemExit(f"Invalid service account JSON: {e}")
+
     gc = gspread.authorize(creds)
     ss = gc.open_by_key(SHEET_ID)
     try:
         ws = ss.worksheet(rep_tab_name)
     except gspread.exceptions.WorksheetNotFound:
         ws = ss.add_worksheet(title=rep_tab_name, rows=2000, cols=50)
+
     today = WEEK_ASSIGNED
     header_row = [f"Week: {today}"]
     columns = ['CompanyName','Website','Domain','HQ_City','HQ_StateProvince','Country','Industry','EmployeeCount','EstimatedFleetSize','GrowthSignalScore','FitScore','DM1_Name','DM1_Title','DM1_LinkedIn','DM1_Email','DM1_Email_Verified','DM1_DirectPhone','DM1_Phone_Verified','Source','Notes','BestCallWindow','AssignedRep','WeekAssigned','LastVerified']
@@ -219,13 +256,22 @@ def append_weekly_block_to_sheet(rep_tab_name, rows):
         ws.append_rows(rows, value_input_option="USER_ENTERED")
     ws.append_row([""], value_input_option="USER_ENTERED")
 
+# -----------------------
+# Main flow
+# -----------------------
 def main():
-    if not should_run_today():
-        print("Not scheduled run day. Exiting.")
+    # Schedule + idempotency
+    if not should_run_today_and_hour():
+        print("Not scheduled run time (local 10:00 America/Vancouver). Exiting.")
         return
 
+    if already_ran_for_week(WEEK_ASSIGNED):
+        print(f"Weekly lists for {WEEK_ASSIGNED} already created (assignment_history found). Exiting.")
+        return
+
+    # Ensure candidates exists
     if not os.path.exists(CANDIDATES_CSV):
-        raise SystemExit(f"{CANDIDATES_CSV} not found. Please add candidates.csv in repo root.")
+        raise SystemExit(f"{CANDIDATES_CSV} not found. Please add candidates.csv in repo root or enable a sourcing step.")
 
     print("Loading candidates...")
     df = pd.read_csv(CANDIDATES_CSV, dtype=str).fillna("")
@@ -285,12 +331,14 @@ def main():
     df_en = pd.DataFrame(enriched)
     df_en["FitScore"] = df_en.apply(compute_fit_score, axis=1)
     df_en = df_en.sort_values("FitScore", ascending=False).drop_duplicates(subset=["Domain","CompanyName"], keep="first").reset_index(drop=True)
+
     def domain_in_recent(domain):
         if not domain:
             return False
         return in_12_months(domain, history_df)
     df_en["recent_assigned"] = df_en["Domain"].apply(domain_in_recent)
     df_en = df_en[~df_en["recent_assigned"]].copy()
+
     top100 = df_en.head(100).reset_index(drop=True)
     top100["AssignedRep"] = ["Evan" if i%2==0 else "Dave" for i in range(len(top100))]
 
