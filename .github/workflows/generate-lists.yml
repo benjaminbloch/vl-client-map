@@ -27,14 +27,13 @@ jobs:
           pip install pandas requests gspread google-auth oauth2client python-dateutil holidays pytz
 
       - name: Set Apollo key from GitHub Secrets
-        # Expose APOLLO_API_KEY to the job via GITHUB_ENV
         run: echo "APOLLO_API_KEY=${{ secrets.APOLLO_API_KEY }}" >> $GITHUB_ENV
 
       - name: Write Google Sheet SA JSON to sa.json
         run: |
-          # Write the secret to a local file for the job workspace.
-          # Avoid parsing it here to prevent parsing errors on runners.
-          echo "${{ secrets.GCP_SA_JSON }}" > sa.json
+          # Safely write the JSON secret into sa.json preserving newlines and quotes
+          printf '%s' "${{ secrets.GCP_SA_JSON }}" > sa.json
+          echo "sa.json written — size: $(wc -c < sa.json) bytes"
           ls -l sa.json
 
       - name: Show environment debug
@@ -42,16 +41,7 @@ jobs:
           echo "APOLLO_API_KEY set? ${APOLLO_API_KEY:+YES}"
           python -c "import os; print('sa.json exists:', os.path.exists('sa.json'))"
 
-      # Optional sourcing step (commented out by default).
-      # If you implement a sourcing script (e.g. source_from_zoho.py), enable this.
-      # - name: Source candidates from Zoho
-      #   env:
-      #     ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
-      #     ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
-      #     ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
-      #   run: |
-      #     python scripts/source_from_zoho.py
-
+      # Manual/TEST run (only when you click Run workflow). FORCE_RUN=1 bypasses schedule/idempotency.
       - name: Run outbound list generator (TEST / manual override)
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -63,6 +53,7 @@ jobs:
           echo "Running generator in TEST mode (FORCE_RUN=1)"
           python scripts/generate_outbound_lists.py
 
+      # Scheduled run (no FORCE_RUN)
       - name: Run outbound list generator (scheduled)
         if: github.event_name != 'workflow_dispatch'
         env:
