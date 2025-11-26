@@ -11,7 +11,7 @@ scripts/generate_outbound_lists.py
 
 Environment:
 - APOLLO_API_KEY     (GitHub secret)
-- GCP_SA_JSON        (GitHub secret with Google service account JSON)
+- GCP_SA_JSON        (GitHub secret with Google service account JSON) OR workflow writes sa.json
 - SHEET_ID           (optional, defaults to the Sheet we used)
 - WEEK_ASSIGNED      (optional override date YYYY-MM-DD)
 
@@ -53,6 +53,19 @@ TITLE_KEYWORDS = [
 ]
 
 # -----------------------
+# Sa.json fallback: if the workflow wrote sa.json instead of providing env var, read it.
+# -----------------------
+if not GCP_SA_JSON:
+    if os.path.exists("sa.json"):
+        try:
+            with open("sa.json", "r", encoding="utf8") as f:
+                GCP_SA_JSON = f.read().strip()
+            if not (GCP_SA_JSON.startswith("{") and GCP_SA_JSON.endswith("}")):
+                print("Warning: sa.json content does not appear to be JSON.")
+        except Exception as e:
+            print("Warning: failed to read sa.json:", e)
+
+# -----------------------
 # Helpers
 # -----------------------
 def should_run_today():
@@ -64,12 +77,10 @@ def should_run_today():
     bc = holidays.CA(prov="BC")
     # Friday that is not a BC holiday
     if weekday == 4 and today not in bc:
-        # also check it's Friday local time >= 10:00 local if you want; but the Action triggers daily, the script will run anyway
         return True
     # If Thursday and Friday is a BC holiday, run Thursday
-    if weekday == 3:
-        if (today + timedelta(days=1)) in bc:
-            return True
+    if weekday == 3 and (today + timedelta(days=1)) in bc:
+        return True
     return False
 
 def canonical_domain(url):
@@ -89,6 +100,8 @@ def apollo_people_by_domain(domain):
         r = requests.get(APOLLO_PEOPLE_ENDPOINT, headers=headers, params=params, timeout=15)
         if r.status_code == 200:
             return r.json().get("people") or []
+        else:
+            print(f"[Apollo] domain search HTTP {r.status_code} for {domain}: {r.text[:400]}")
     except Exception as e:
         print("Apollo domain search error:", e)
     return []
@@ -102,6 +115,8 @@ def apollo_people_by_company(company):
         r = requests.get(APOLLO_PEOPLE_ENDPOINT, headers=headers, params=params, timeout=15)
         if r.status_code == 200:
             return r.json().get("people") or []
+        else:
+            print(f"[Apollo] company search HTTP {r.status_code} for {company}: {r.text[:400]}")
     except Exception as e:
         print("Apollo company search error:", e)
     return []
@@ -109,18 +124,15 @@ def apollo_people_by_company(company):
 def pick_decision_maker(people):
     if not people:
         return None
-    # prefer exact title keywords
     for kw in TITLE_KEYWORDS:
         for p in people:
             title = (p.get("title") or "").lower()
             if kw.lower() in title:
                 return p
-    # prefer seniority or director/vp-like titles
     for p in people:
         title = (p.get("title") or "").lower()
-        if any(x in title for x in ("director", "vp", "vice", "head", "manager")):
+        if any(x in title for x in ("director","vp","vice","head","manager")):
             return p
-    # fallback first
     return people[0]
 
 def compute_fit_score(row):
@@ -136,12 +148,10 @@ def compute_fit_score(row):
             score += 10
     except:
         score += 5
-    # verified contact heuristics
     if row.get("DM1_Email") and row.get("DM1_DirectPhone"):
         score += 30
     elif row.get("DM1_Email") or row.get("DM1_DirectPhone"):
         score += 10
-    # small tie-breakers
     return min(100, int(score))
 
 def read_prior_domains():
@@ -182,12 +192,18 @@ def in_12_months(domain, history_df):
     return not recent.empty
 
 def append_weekly_block_to_sheet(rep_tab_name, rows):
-    # Expect rows = list of lists with exact columns
-    # Authorize gspread using JSON from GCP_SA_JSON secret
     sa_json = GCP_SA_JSON
     if not sa_json:
-        raise SystemExit("GCP_SA_JSON not provided as env secret")
-    creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        if os.path.exists("sa.json"):
+            with open("sa.json","r",encoding="utf8") as f:
+                sa_json = f.read().strip()
+    if not sa_json:
+        raise SystemExit("No Google service account JSON available (GCP_SA_JSON or sa.json).")
+
+    try:
+        creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    except Exception as e:
+        raise SystemExit(f"Invalid service account JSON: {e}")
     gc = gspread.authorize(creds)
     ss = gc.open_by_key(SHEET_ID)
     try:
@@ -203,11 +219,7 @@ def append_weekly_block_to_sheet(rep_tab_name, rows):
         ws.append_rows(rows, value_input_option="USER_ENTERED")
     ws.append_row([""], value_input_option="USER_ENTERED")
 
-# -----------------------
-# Main flow
-# -----------------------
 def main():
-    # quick schedule check
     if not should_run_today():
         print("Not scheduled run day. Exiting.")
         return
@@ -219,16 +231,12 @@ def main():
     df = pd.read_csv(CANDIDATES_CSV, dtype=str).fillna("")
     df = canonicalize_candidates(df)
 
-    # build exclusion set (prior grok)
     prior_domains = read_prior_domains()
     history_df = load_assignment_history()
 
-    # filter out prior domains permanently (we are using 12-month overlap + prior grok as permanent)
-    # permanent excludes: any prior grok domains
     df["canonical_domain"] = df["Domain"].apply(canonical_domain)
     df = df[~df["canonical_domain"].isin(prior_domains)].copy()
 
-    # Enrichment loop
     enriched = []
     print("Enriching candidates with Apollo (people)...")
     for idx, r in df.iterrows():
@@ -259,7 +267,6 @@ def main():
             row["DM1_Title"] = dm.get("title") or ""
             row["DM1_LinkedIn"] = dm.get("linkedin_url") or dm.get("linkedin") or ""
             row["DM1_Email"] = dm.get("email") or ""
-            # Apollo phone fields vary — try a couple
             phone = dm.get("phone") or ""
             if isinstance(phone, list) and phone:
                 phone = phone[0].get("number") if isinstance(phone[0], dict) else phone[0]
@@ -271,34 +278,22 @@ def main():
                 "DM1_Name": "", "DM1_Title":"", "DM1_LinkedIn":"", "DM1_Email":"",
                 "DM1_DirectPhone":"", "DM1_Email_Verified":"", "DM1_Phone_Verified":""
             })
-        # leave GrowthSignalScore blank for now; could be enhanced
         row["GrowthSignalScore"] = ""
         enriched.append(row)
-        time.sleep(0.2)  # throttle Apollo requests
+        time.sleep(0.2)
 
     df_en = pd.DataFrame(enriched)
-    # FitScore
     df_en["FitScore"] = df_en.apply(compute_fit_score, axis=1)
-
-    # dedupe by domain
     df_en = df_en.sort_values("FitScore", ascending=False).drop_duplicates(subset=["Domain","CompanyName"], keep="first").reset_index(drop=True)
-
-    # apply 12-month overlap: exclude domains assigned in the last 365 days
     def domain_in_recent(domain):
         if not domain:
             return False
         return in_12_months(domain, history_df)
     df_en["recent_assigned"] = df_en["Domain"].apply(domain_in_recent)
-    # Keep rows where recent_assigned is False
     df_en = df_en[~df_en["recent_assigned"]].copy()
-
-    # select top 100
     top100 = df_en.head(100).reset_index(drop=True)
-
-    # alternate assign Evan/Dave
     top100["AssignedRep"] = ["Evan" if i%2==0 else "Dave" for i in range(len(top100))]
 
-    # Prepare rows for sheet (exact column order)
     def to_sheet_rows(df_block, rep):
         rows = []
         for _, r in df_block.iterrows():
@@ -323,7 +318,7 @@ def main():
                 r.get("DM1_Phone_Verified",""),
                 r.get("Source",""),
                 r.get("Notes",""),
-                "",  # BestCallWindow (empty)
+                "",
                 rep,
                 WEEK_ASSIGNED,
                 datetime.utcnow().strftime("%Y-%m-%d")
@@ -335,12 +330,10 @@ def main():
     evan_rows = to_sheet_rows(evan_df, "Evan")
     dave_rows = to_sheet_rows(dave_df, "Dave")
 
-    # Append to Sheet
     print("Appending to Google Sheet...")
     append_weekly_block_to_sheet("Evan", evan_rows)
     append_weekly_block_to_sheet("Dave", dave_rows)
 
-    # update assignment_history.csv
     hist = load_assignment_history()
     for _, r in top100.iterrows():
         hist = hist.append({
