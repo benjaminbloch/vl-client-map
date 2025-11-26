@@ -2,7 +2,7 @@ name: Generate Outbound Lists
 
 on:
   schedule:
-    - cron: '0 17 * * *'   # daily 17:00 UTC (script will decide whether to run)
+    - cron: '*/15 * * * *'   # run every 15 minutes (script gates by local time)
   workflow_dispatch: {}
 
 permissions:
@@ -13,40 +13,48 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pandas requests gspread google-auth oauth2client python-dateutil holidays pytz
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests gspread google-auth oauth2client python-dateutil holidays pytz
 
-    - name: Set Apollo key from GitHub Secrets
-      # Expose APOLLO_API_KEY to the job via GITHUB_ENV
-      run: echo "APOLLO_API_KEY=${{ secrets.APOLLO_API_KEY }}" >> $GITHUB_ENV
+      - name: Set Apollo key from GitHub Secrets
+        # Expose APOLLO_API_KEY to the job via GITHUB_ENV
+        run: echo "APOLLO_API_KEY=${{ secrets.APOLLO_API_KEY }}" >> $GITHUB_ENV
 
-    - name: Write Google Sheet SA JSON to sa.json
-      run: |
-        # Write the secret to a local file for the job workspace.
-        # Avoid parsing it here to prevent parsing errors on runners.
-        echo "${{ secrets.GCP_SA_JSON }}" > sa.json
-        # Sanity list the file to ensure it exists
-        ls -l sa.json
+      - name: Write Google Sheet SA JSON to sa.json
+        run: |
+          # Write the secret to a local file for the job workspace.
+          # Avoid parsing it here to prevent parsing errors on runners.
+          echo "${{ secrets.GCP_SA_JSON }}" > sa.json
+          ls -l sa.json
 
-    - name: Show environment debug
-      run: |
-        echo "APOLLO_API_KEY set? ${APOLLO_API_KEY:+YES}"
-        python -c "import os; print('sa.json exists:', os.path.exists('sa.json'))"
+      - name: Show environment debug
+        run: |
+          echo "APOLLO_API_KEY set? ${APOLLO_API_KEY:+YES}"
+          python -c "import os; print('sa.json exists:', os.path.exists('sa.json'))"
 
-    - name: Run outbound list generator
-      env:
-        APOLLO_API_KEY: ${{ env.APOLLO_API_KEY }}
-        SHEET_ID: '1vVFmYqyedxNbzJWKpU4hjJhDbs96q4QqDlcq0bSIlNA'  # keep or change to your sheet id
-        WEEK_ASSIGNED: ${{ github.event.inputs.week_assigned || '' }}
-      run: |
-        python scripts/generate_outbound_lists.py
+      - name: (Optional) Source candidates (Zoho or Apollo)
+        # Uncomment and use once you add the sourcing script and secrets.
+        # env:
+        #   ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+        #   ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+        #   ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+        # run: |
+        #   python scripts/source_from_zoho.py
+
+      - name: Run outbound list generator
+        env:
+          APOLLO_API_KEY: ${{ env.APOLLO_API_KEY }}
+          SHEET_ID: '1vVFmYqyedxNbzJWKpU4hjJhDbs96q4QqDlcq0bSIlNA'
+          WEEK_ASSIGNED: ${{ github.event.inputs.week_assigned || '' }}
+        run: |
+          python scripts/generate_outbound_lists.py
