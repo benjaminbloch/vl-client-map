@@ -1,0 +1,7 @@
+Company,Website,City,State,Country,Industry,EmployeeCount,EstimatedFleetSize,Source,Notes
+Acme Logistics,acme.com,Los Angeles,CA,US,Logistics,250,200,Grok,"Test company 1"
+NorthStar Transport,northstar.com,Atlanta,GA,US,Transportation,180,150,Grok,"Test company 2"
+Maple Courier,maplecourier.ca,Toronto,ON,CA,Delivery,120,120,Grok,"Test company 3"
+Pioneer Fleet,pioneerfleet.com,Seattle,WA,US,Field Service,90,110,Grok,"Test company 4"
+Rapid Freight,rapidfreight.com,Dallas,TX,US,Trucking,300,350,Grok,"Test company 5"
+Coastal Dispatch,coastaldispatch.com,Miami,FL,US,Distribution,140,130,Grok,"Test company 6"
