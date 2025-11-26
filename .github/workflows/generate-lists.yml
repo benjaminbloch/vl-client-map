@@ -42,19 +42,32 @@ jobs:
           echo "APOLLO_API_KEY set? ${APOLLO_API_KEY:+YES}"
           python -c "import os; print('sa.json exists:', os.path.exists('sa.json'))"
 
-      - name: (Optional) Source candidates (Zoho or Apollo)
-        # Uncomment and use once you add the sourcing script and secrets.
-        # env:
-        #   ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
-        #   ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
-        #   ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
-        # run: |
-        #   python scripts/source_from_zoho.py
+      # Optional sourcing step (commented out by default).
+      # If you implement a sourcing script (e.g. source_from_zoho.py), enable this.
+      # - name: Source candidates from Zoho
+      #   env:
+      #     ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+      #     ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+      #     ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+      #   run: |
+      #     python scripts/source_from_zoho.py
 
-      - name: Run outbound list generator
+      - name: Run outbound list generator (TEST / manual override)
+        if: github.event_name == 'workflow_dispatch'
         env:
           APOLLO_API_KEY: ${{ env.APOLLO_API_KEY }}
-          SHEET_ID: '1vVFmYqyedxNbzJWKpU4hjJhDbs96q4QqDlcq0bSIlNA'
+          SHEET_ID: ${{ secrets.SHEET_ID || '1vVFmYqyedxNbzJWKpU4hjJhDbs96q4QqDlcq0bSIlNA' }}
+          WEEK_ASSIGNED: ${{ github.event.inputs.week_assigned || '' }}
+          FORCE_RUN: '1'
+        run: |
+          echo "Running generator in TEST mode (FORCE_RUN=1)"
+          python scripts/generate_outbound_lists.py
+
+      - name: Run outbound list generator (scheduled)
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          APOLLO_API_KEY: ${{ env.APOLLO_API_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID || '1vVFmYqyedxNbzJWKpU4hjJhDbs96q4QqDlcq0bSIlNA' }}
           WEEK_ASSIGNED: ${{ github.event.inputs.week_assigned || '' }}
         run: |
           python scripts/generate_outbound_lists.py
