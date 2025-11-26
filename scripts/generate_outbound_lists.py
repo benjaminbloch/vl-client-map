@@ -2,22 +2,7 @@
 """
 scripts/generate_outbound_lists.py
 
-Fully automated weekly list generator:
-- Runs only at Friday 10:00 AM America/Vancouver (or Thursday 10:00 AM if Friday is a BC stat)
-- Idempotent: will not re-run for the same WEEK_ASSIGNED if assignment_history already contains it
-- Loads candidates.csv (or you can add an upstream sourcing step)
-- Enriches via Apollo, computes FitScore, dedupes, respects 12-month overlap
-- Produces two 50-company weekly blocks and appends to Google Sheet tabs 'Evan' and 'Dave'
-
-Environment:
-- APOLLO_API_KEY     (GitHub secret)
-- GCP_SA_JSON        (GitHub secret with Google Sheets service account JSON) OR workflow writes sa.json
-- SHEET_ID           (defaults to your existing sheet)
-- WEEK_ASSIGNED      (optional override)
-- FORCE_RUN          (optional manual override: '1' / 'true')
-
-Dependencies:
-pip install requests pandas gspread google-auth python-dateutil holidays pytz
+Weekly outbound list generator — full file (corrected).
 """
 
 import os
@@ -54,15 +39,13 @@ TITLE_KEYWORDS = [
 ]
 
 # -----------------------
-# Sa.json fallback: read sa.json file if env is missing
+# Read sa.json fallback
 # -----------------------
 if not GCP_SA_JSON:
     if os.path.exists("sa.json"):
         try:
             with open("sa.json", "r", encoding="utf8") as f:
                 GCP_SA_JSON = f.read().strip()
-            if not (GCP_SA_JSON.startswith("{") and GCP_SA_JSON.endswith("}")):
-                print("Warning: sa.json content does not appear to be JSON.")
         except Exception as e:
             print("Warning: failed to read sa.json:", e)
 
@@ -70,17 +53,11 @@ if not GCP_SA_JSON:
 # Scheduling & idempotency helpers
 # -----------------------
 def should_run_today_and_hour(target_hour=10, window_minutes=60):
-    """
-    Return True if:
-      - it's Friday (local America/Vancouver) and current local time is within target_hour window,
-        AND that Friday is not a BC stat holiday,
-      - OR it's Thursday local time and tomorrow is a BC stat holiday (run Thursday in the same local hour).
-    """
     tz = pytz.timezone(TIMEZONE)
     now_local = datetime.now(tz)
     today_local = now_local.date()
     weekday = today_local.weekday()  # Mon=0 ... Sun=6
-    bc_holidays = holidays.CA(prov='BC')
+    bc_holidays = holidays.CA(prov="BC")
 
     start = now_local.replace(hour=target_hour, minute=0, second=0, microsecond=0)
     end = start + timedelta(minutes=window_minutes)
@@ -99,10 +76,6 @@ def should_run_today_and_hour(target_hour=10, window_minutes=60):
     return False
 
 def already_ran_for_week(week_assigned_str):
-    """
-    Return True if assignment_history.csv already contains entries for the given WeekAssigned.
-    Prevents duplicate runs for the same WEEK_ASSIGNED.
-    """
     if not os.path.exists(ASSIGNMENT_HISTORY):
         return False
     try:
@@ -135,7 +108,7 @@ def apollo_people_by_domain(domain):
         if r.status_code == 200:
             return r.json().get("people") or []
         else:
-            print(f"[Apollo] domain search HTTP {r.status_code} for {domain}: {r.text[:400]}")
+            print(f"[Apollo] domain search HTTP {r.status_code} for {domain}")
     except Exception as e:
         print("Apollo domain search error:", e)
     return []
@@ -150,7 +123,7 @@ def apollo_people_by_company(company):
         if r.status_code == 200:
             return r.json().get("people") or []
         else:
-            print(f"[Apollo] company search HTTP {r.status_code} for {company}: {r.text[:400]}")
+            print(f"[Apollo] company search HTTP {r.status_code} for {company}")
     except Exception as e:
         print("Apollo company search error:", e)
     return []
@@ -165,7 +138,7 @@ def pick_decision_maker(people):
                 return p
     for p in people:
         title = (p.get("title") or "").lower()
-        if any(x in title for x in ("director","vp","vice","head","manager")):
+        if any(x in title for x in ("director", "vp", "vice", "head", "manager")):
             return p
     return people[0]
 
@@ -195,8 +168,227 @@ def read_prior_domains():
     domains = set()
     for path in [PRIOR_GROK_EVAN, PRIOR_GROK_DAVE]:
         try:
+            if not os.path.exists(path):
+                continue
             df = pd.read_csv(path, dtype=str)
             if "Website" in df.columns:
-                domains |= set(df["Website"].fillna("").apply(canonical_domain).unique())
+                sites = df["Website"].fillna("").apply(canonical_domain).unique()
+                domains.update([s for s in sites if s])
             if "Domain" in df.columns:
-                domains |= set(df["Domain"].fillna("").apply(cano
+                doms = df["Domain"].fillna("").apply(canonical_domain).unique()
+                domains.update([d for d in doms if d])
+        except Exception:
+            continue
+    return set(domains)
+
+def canonicalize_candidates(df):
+    if "Website" in df.columns:
+        df["Domain"] = df["Website"].fillna("").apply(canonical_domain)
+    else:
+        df["Domain"] = ""
+    return df
+
+def load_assignment_history():
+    if os.path.exists(ASSIGNMENT_HISTORY):
+        try:
+            h = pd.read_csv(ASSIGNMENT_HISTORY, parse_dates=["WeekAssigned"])
+            h["domain"] = h["Domain"].fillna("").apply(canonical_domain)
+            return h
+        except Exception:
+            return pd.DataFrame(columns=["Domain","CompanyName","AssignedRep","WeekAssigned","LastDisposition"])
+    else:
+        return pd.DataFrame(columns=["Domain","CompanyName","AssignedRep","WeekAssigned","LastDisposition"])
+
+def in_12_months(domain, history_df):
+    if not domain:
+        return False
+    cutoff = datetime.utcnow() - timedelta(days=365)
+    try:
+        recent = history_df[(history_df["domain"] == domain) & (pd.to_datetime(history_df["WeekAssigned"], errors="coerce") >= cutoff)]
+        return not recent.empty
+    except Exception:
+        return False
+
+# -----------------------
+# Sheets helper
+# -----------------------
+def append_weekly_block_to_sheet(rep_tab_name, rows):
+    sa_json = GCP_SA_JSON
+    if not sa_json and os.path.exists("sa.json"):
+        with open("sa.json", "r", encoding="utf8") as f:
+            sa_json = f.read().strip()
+    if not sa_json:
+        raise SystemExit("No Google service account JSON available (GCP_SA_JSON or sa.json).")
+
+    try:
+        creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    except Exception as e:
+        raise SystemExit(f"Invalid service account JSON: {e}")
+
+    gc = gspread.authorize(creds)
+    ss = gc.open_by_key(SHEET_ID)
+    try:
+        ws = ss.worksheet(rep_tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title=rep_tab_name, rows=2000, cols=50)
+
+    today = WEEK_ASSIGNED
+    header_row = [f"Week: {today}"]
+    columns = [
+        'CompanyName','Website','Domain','HQ_City','HQ_StateProvince','Country','Industry',
+        'EmployeeCount','EstimatedFleetSize','GrowthSignalScore','FitScore','DM1_Name','DM1_Title',
+        'DM1_LinkedIn','DM1_Email','DM1_Email_Verified','DM1_DirectPhone','DM1_Phone_Verified',
+        'Source','Notes','BestCallWindow','AssignedRep','WeekAssigned','LastVerified'
+    ]
+    ws.append_row(header_row, value_input_option="USER_ENTERED")
+    ws.append_row(columns, value_input_option="USER_ENTERED")
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+    ws.append_row([""], value_input_option="USER_ENTERED")
+
+# -----------------------
+# Main flow
+# -----------------------
+def main():
+    # FORCE_RUN override for manual testing
+    FORCE_RUN = os.environ.get('FORCE_RUN', '').strip().lower() in ('1', 'true', 'yes')
+
+    if FORCE_RUN:
+        print("FORCE_RUN enabled: bypassing schedule and idempotency checks for test run.")
+    else:
+        # Schedule + idempotency
+        if not should_run_today_and_hour():
+            print("Not scheduled run time (local 10:00 America/Vancouver). Exiting.")
+            return
+
+        if already_ran_for_week(WEEK_ASSIGNED):
+            print(f"Weekly lists for {WEEK_ASSIGNED} already created (assignment_history found). Exiting.")
+            return
+
+    # Ensure candidates exists
+    if not os.path.exists(CANDIDATES_CSV):
+        raise SystemExit(f"{CANDIDATES_CSV} not found. Please add candidates.csv in repo root or enable a sourcing step.")
+
+    print("Loading candidates...")
+    df = pd.read_csv(CANDIDATES_CSV, dtype=str).fillna("")
+    df = canonicalize_candidates(df)
+
+    prior_domains = read_prior_domains()
+    history_df = load_assignment_history()
+
+    df["canonical_domain"] = df["Domain"].apply(canonical_domain)
+    df = df[~df["canonical_domain"].isin(prior_domains)].copy()
+
+    enriched = []
+    print("Enriching candidates with Apollo (people)...")
+    for idx, r in df.iterrows():
+        company = r.get("Company") or r.get("CompanyName") or r.get("company") or ""
+        domain = r.get("canonical_domain","")
+        row = {
+            "CompanyName": company,
+            "Website": r.get("Website",""),
+            "Domain": domain,
+            "HQ_City": r.get("City",""),
+            "HQ_StateProvince": r.get("State",""),
+            "Country": r.get("Country",""),
+            "Industry": r.get("Industry",""),
+            "EmployeeCount": r.get("EmployeeCount",""),
+            "EstimatedFleetSize": r.get("EstimatedFleetSize",""),
+            "Source": r.get("Source",""),
+            "Notes": r.get("Notes","")
+        }
+
+        people = []
+        if domain:
+            people = apollo_people_by_domain(domain)
+        if not people:
+            people = apollo_people_by_company(company)
+        dm = pick_decision_maker(people) if people else None
+        if dm:
+            row["DM1_Name"] = dm.get("name") or ""
+            row["DM1_Title"] = dm.get("title") or ""
+            row["DM1_LinkedIn"] = dm.get("linkedin_url") or dm.get("linkedin") or ""
+            row["DM1_Email"] = dm.get("email") or ""
+            phone = dm.get("phone") or ""
+            if isinstance(phone, list) and phone:
+                phone = phone[0].get("number") if isinstance(phone[0], dict) else phone[0]
+            row["DM1_DirectPhone"] = phone or dm.get("direct_phone") or ""
+            row["DM1_Email_Verified"] = "unknown"
+            row["DM1_Phone_Verified"] = "unknown"
+        else:
+            row.update({
+                "DM1_Name": "", "DM1_Title":"", "DM1_LinkedIn":"", "DM1_Email":"",
+                "DM1_DirectPhone":"", "DM1_Email_Verified":"", "DM1_Phone_Verified":""
+            })
+        row["GrowthSignalScore"] = ""
+        enriched.append(row)
+        time.sleep(0.2)
+
+    df_en = pd.DataFrame(enriched)
+    df_en["FitScore"] = df_en.apply(compute_fit_score, axis=1)
+    df_en = df_en.sort_values("FitScore", ascending=False).drop_duplicates(subset=["Domain","CompanyName"], keep="first").reset_index(drop=True)
+
+    def domain_in_recent(domain):
+        if not domain:
+            return False
+        return in_12_months(domain, history_df)
+    df_en["recent_assigned"] = df_en["Domain"].apply(domain_in_recent)
+    df_en = df_en[~df_en["recent_assigned"]].copy()
+
+    top100 = df_en.head(100).reset_index(drop=True)
+    top100["AssignedRep"] = ["Evan" if i%2==0 else "Dave" for i in range(len(top100))]
+
+    def to_sheet_rows(df_block, rep):
+        rows = []
+        for _, r in df_block.iterrows():
+            rows.append([
+                r.get("CompanyName",""),
+                r.get("Website",""),
+                r.get("Domain",""),
+                r.get("HQ_City",""),
+                r.get("HQ_StateProvince",""),
+                r.get("Country",""),
+                r.get("Industry",""),
+                r.get("EmployeeCount",""),
+                r.get("EstimatedFleetSize",""),
+                r.get("GrowthSignalScore",""),
+                int(r.get("FitScore") or 0),
+                r.get("DM1_Name",""),
+                r.get("DM1_Title",""),
+                r.get("DM1_LinkedIn",""),
+                r.get("DM1_Email",""),
+                r.get("DM1_Email_Verified",""),
+                r.get("DM1_DirectPhone",""),
+                r.get("DM1_Phone_Verified",""),
+                r.get("Source",""),
+                r.get("Notes",""),
+                "",
+                rep,
+                WEEK_ASSIGNED,
+                datetime.utcnow().strftime("%Y-%m-%d")
+            ])
+        return rows
+
+    evan_df = top100[top100["AssignedRep"]=="Evan"].head(50)
+    dave_df = top100[top100["AssignedRep"]=="Dave"].head(50)
+    evan_rows = to_sheet_rows(evan_df, "Evan")
+    dave_rows = to_sheet_rows(dave_df, "Dave")
+
+    print("Appending to Google Sheet...")
+    append_weekly_block_to_sheet("Evan", evan_rows)
+    append_weekly_block_to_sheet("Dave", dave_rows)
+
+    hist = load_assignment_history()
+    for _, r in top100.iterrows():
+        hist = hist.append({
+            "Domain": r.get("Domain",""),
+            "CompanyName": r.get("CompanyName",""),
+            "AssignedRep": r.get("AssignedRep",""),
+            "WeekAssigned": WEEK_ASSIGNED,
+            "LastDisposition": ""
+        }, ignore_index=True)
+    hist.to_csv(ASSIGNMENT_HISTORY, index=False)
+    print("Completed list generation; Evan and Dave lists appended to sheet.")
+
+if __name__ == "__main__":
+    main()
